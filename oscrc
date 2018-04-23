@@ -113,7 +113,7 @@ apiurl = https://api.opensuse.org
 
 [https://api.opensuse.org]
 user = linwenkai
-pass = lwk0228
+pass = estuary@123
 # set aliases for this apiurl
 # aliases = foo, bar
 # email used in .changes, unless the one from osc meta prj <user> will be used
@@ -129,4 +129,4 @@ trusted_prj=openSUSE:Factory:ARM SUSE:SLE-12-SP2:GA Virtualization:Appliances
 
 [https://api.suse.de]
 user=linwenkai
-pass=lwk0228
+pass=estuary@123
