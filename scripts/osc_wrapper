@@ -1,0 +1,375 @@
+#!/bin/bash
+#
+# Building kernels with osc made easy
+
+die()
+{
+	echo -e "$@" >&2
+	exit 1
+}
+
+usage()
+{
+	die \
+"Usage: $0 [build] [--ibs | --obs] [--enable-debug | --debug | --disable-debug] [--do-checks | --no-checks] [--ignore-kabi] [--klp-symbols] [<osc_args>] [<specfile>]\n
+       $0 upload [ --ibs | --obs ] [--enable-debug | --debug | --disable-debug] [--do-checks | --no-checks] [--ignore-kabi] [--klp-symbols] project [<specfile> | directory]"
+}
+
+osc()
+{
+	echo "osc" $API "$@"
+	command osc $API "$@"
+}
+
+_osc()
+{
+	command osc $API "$@"
+}
+
+try_spec()
+{
+	local spec=$1
+
+	if test -e "$spec"; then
+		echo "$spec"
+		return 0
+	elif test -e "kernel-source$VARIANT/$spec"; then
+		echo "$_"
+		return 0
+	else
+		return 1
+	fi
+}
+
+find_spec()
+{
+	local spec machine=$(uname -m)
+
+	case "$machine" in
+	i?86 | x86_64)
+		if try_spec kernel-smp.spec; then
+			return 0
+		fi
+	esac
+	case "$machine" in
+	i?86)
+		if try_spec kernel-pae.spec; then
+			return 0
+		fi
+	esac
+	if try_spec kernel-default.spec; then
+		return 0
+	fi
+	if test -n "$VARIANT" && try_spec "kernel$VARIANT.spec"; then
+		return 0
+	fi
+	if test -n "$VANILLA_ONLY"; then
+		if try_spec kernel-vanilla.spec; then
+			return 0
+		fi
+	fi
+	echo "Unable to find a specfile to build" >&2
+	return 1
+}
+
+check_dir_commit()
+{
+	local dir=$1 git_commit dir_commit
+
+	git_commit=$(git rev-parse HEAD 2>/dev/null) || return
+	dir_commit=$(sed -n 's/GIT Revision: //p' "$dir"/*source-timestamp)
+	if test "$git_commit" != "$dir_commit"; then
+		echo "$dir (${dir_commit:0:7}) does not match your current HEAD (${git_commit:0:7})" >&2
+		echo "Maybe you forgot to run scripts/tar-up.sh?" >&2
+	fi
+}
+
+get_branch()
+{
+	local res version sp
+
+	# First, try the local branch name
+	res=$(sed -ne 'y|/|:|; s|^ref: refs:heads:||p' "$topdir/.git/HEAD" 2>/dev/null)
+	if test -n "$res"; then
+		if project_exists "$kotd_namespace:$res"; then
+			echo "$res"
+			return
+		fi
+		echo "Warning: $kotd_namespace:$res not found at $WEBCLIENT, trying harder" >&2
+		res=
+	else
+		echo "Warning: Could not determine your git branch" >&2
+	fi
+	# For SLE branches, try IBS_PROJECT
+	case "$IBS_PROJECT" in
+	SUSE:SLE-*)
+		# SUSE:SLE-10-SP4:Update -> 10-SP4:Update
+		version=${IBS_PROJECT#SUSE:SLE-}
+		# 10-SP4:Update -> 4:Update
+		sp=${version#*-SP}
+		if test "$sp" != "$version"; then
+			# 4:Update -> 4
+			sp=${sp%%:*}
+		else
+			sp=
+		fi
+		# 10-SP4:Update -> 10
+		# 12:GA -> 12
+		version=${version%%[-:]*}
+		if test "$version" -ge 11; then
+			res="SLE$version"
+		else
+			res="SLES$version"
+		fi
+		if test -n "$sp"; then
+			res="$res-SP$sp"
+		fi
+		if project_exists "$kotd_namespace:$res"; then
+			echo "$res"
+			return
+		fi
+		echo "Branch $kotd_namespace:$res not found at $WEBCLIENT" >&2
+		exit 1
+	esac
+	case "$OBS_PROJECT" in
+	openSUSE:Factory*)
+		if $internal; then
+			res=master
+		else
+			res=HEAD
+		fi
+		;;
+	openSUSE:*)
+		version=${OBS_PROJECT#openSUSE:}
+		version=${version%%:*}
+		res="openSUSE-$version"
+		;;
+	esac
+	if test -n "$res"; then
+		if project_exists "$kotd_namespace:$res"; then
+			echo "$res"
+			return
+		fi
+		echo "Branch $kotd_namespace:$res not found at $WEBCLIENT" >&2
+	else
+		echo "Could not determine the official name of this branch" >&2
+	fi
+	exit 1
+}
+
+setup_api()
+{
+	local wanted=$1 internal=false kotd_namespace branch
+
+	if test "$wanted" = "--ibs"; then
+		internal=true
+	elif test -z "$wanted"; then
+		if test -z "$OBS_PROJECT"; then
+			echo "Using the IBS"
+			internal=true
+		fi
+	fi
+	if $internal; then
+		API="-A https://api.suse.de"
+		WEBCLIENT="https://build.suse.de"
+		kotd_namespace="Devel:Kernel"
+	else
+		API="-A https://api.opensuse.org"
+		WEBCLIENT="https://build.opensuse.org"
+		kotd_namespace="Kernel"
+	fi
+	if ! osc $API api /about >/dev/null </dev/null; then
+		echo "osc is not configured, run \`osc $API ls' first" >&2
+		exit 1
+	fi
+	branch=$(get_branch)
+	if test -n "$branch"; then
+		# We try to build against Kernel:foo in case the kernel build
+		# requires some extra packages not yet available in the 
+		# official project
+		PROJECT="$kotd_namespace:$branch"
+	else
+		# ... but we fall back to openSUSE:X.Y or SUSE:SLE-XY
+		if $internal; then
+			PROJECT=$IBS_PROJECT
+		else
+			PROJECT=$OBS_PROJECT
+		fi
+		echo "Building against $PROJECT directly as a fallback"
+	fi
+}
+
+project_exists()
+{
+	local project=$1
+
+	_osc meta prj "$project" &>/dev/null
+}
+
+
+#### build ####
+
+do_build()
+{
+	local osc_args=() debuginfo=false checks=false kabi=true klps=false api
+
+	while test $# -gt 0; do
+		case "$1" in
+		--enable-debug* | --debug*)
+			debuginfo=true
+			shift
+			;;
+		--disable-debug*)
+			debuginfo=false
+			shift
+			;;
+		--do-checks)
+			checks=true
+			shift
+			;;
+		--no-checks | --nochecks)
+			checks=false
+			shift
+			;;
+		--ibs | --obs)
+			api=$1
+			shift
+			;;
+		--ignore-kabi)
+			kabi=false
+			shift
+			;;
+		--klp-symbols)
+			klps=true
+			shift
+			;;
+		*.spec)
+			if test $# -eq 1; then
+				spec=$1
+			else
+				osc_args=("${osc_args[@]}" "$1")
+			fi
+			shift
+			;;
+		*)
+			osc_args=("${osc_args[@]}" "$1")
+			shift
+			;;
+		esac
+	done
+	if test -z "$spec"; then
+		spec=$(find_spec) || usage
+	fi
+	check_dir_commit "$(dirname "$spec")"
+	if $debuginfo; then
+		osc_args=("${osc_args[@]}" --debuginfo)
+	else
+		osc_args=("${osc_args[@]}" --disable-debuginfo)
+	fi
+	if ! $checks; then
+		osc_args=("${osc_args[@]}" --no-checks
+		--extra-pkgs=-brp-check-suse --extra-pkgs=-post-build-checks)
+	fi
+	if $kabi; then
+		osc_args=("${osc_args[@]}" --define 'ignore_kabi_badness 0')
+	fi
+	if ! $klps; then
+		osc_args=("${osc_args[@]}" --define 'skip_klp_symbols 1')
+	fi
+
+	arch=$(uname -m | sed 's/^i.86$/i586/')
+	setup_api $api
+
+	rm -rf "$(dirname "$spec")/.osc"
+	osc build --local-package --alternative-project="$PROJECT" \
+		"${osc_args[@]}" ARM "$spec"
+}
+
+### upload ###
+
+do_upload()
+{
+	local api home_project flavor  debuginfo="" checks="" args=()
+
+	api="https://api.opensuse.org"
+
+	while test $# -gt 0
+	do
+	    case $1 in
+		--ibs) api="https://api.suse.de"; shift ;;
+		--obs) api="https://api.opensuse.org"; shift ;;
+		--enable-debug|--debug) debuginfo="--debuginfo"; shift ;;
+		--disable-debug) debuginfo=""; shift ;;
+		--do-checks) checks="--enable-checks"; shift ;;
+		--no-checks) checks=""; shift ;;
+		-*) args=("${args[@]}" "$1"); shift ;;
+		*)  break ;;
+	    esac
+	done
+	args=(-A "$api" "${args[@]}" $debuginfo $checks)
+	case $# in
+	1)
+		home_project=$1
+		spec=$(try_spec kernel-source$VARIANT.spec)
+		if test -z "$spec"; then
+			die "Can't find kernel-source$VARIANT directory"
+		fi
+		dir=$(dirname "$spec")
+		;;
+	2)
+		home_project=$1
+		case "$2" in
+		*.spec)
+			flavor=${2##*/kernel-}
+			args=("${args[@]}" --flavor ${flavor%.spec})
+			dir=${2%/*}
+			;;
+		*)
+			dir=$2
+		esac
+		;;
+	*)
+		usage
+	esac
+	check_dir_commit "$dir"
+
+	cmd=("$(dirname "$0")/bs-upload-kernel" "${args[@]}" "$dir" "$home_project")
+	if test "$(basename "$dir")" != "kernel-source$VARIANT"; then
+		cmd=("${cmd[@]}" "kernel-source$VARIANT")
+	fi
+	echo "${cmd[@]}"
+	"${cmd[@]}" || exit
+
+	echo "Done. You can watch the build progress at"
+	echo "  ${api/api./build.}/project/monitor?project=${home_project//[:\/]/%3A}"
+}
+
+command=
+spec=
+topdir=$(dirname "$0")/..
+
+# change 'osc_wrapper --ibs upload' to 'osc_wrapper upload --ibs'
+case "$1" in
+--ibs| --obs)
+	api=$1
+	cmd=$2
+	shift 2
+	set -- "$cmd" "$api" "$@"
+esac
+
+case "$1" in
+build | upload)
+	command=$1
+	shift
+	;;
+-h|--help) usage ;;
+-* | "" | *.spec)
+	# "build" is the default
+	command=build
+	;;
+*)
+	usage
+esac
+
+source "$topdir/rpm/config.sh"
+do_$command "$@"

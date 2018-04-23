@@ -1,0 +1,91 @@
+#!/bin/bash
+# Add suse Kernel repo headers to a patch created using git-format-patch 
+#
+# Brandon Philips <bphilips@suse.de>
+
+PATH=$(dirname $0):$PATH
+
+if [ $# -lt 1 ]; then
+	echo "usage: $0 <filename> <kernel clone> <repo url>"
+	echo "Add relevant headers for patches pulled from git"
+	echo ""
+	echo "Adds a Git-commit: tag using the From header"
+	echo ""
+	echo "Adds a Patch-mainline: tag if <kernel path> is given"
+	echo "	a useful tree name can be provided in <kernel name>"
+	echo "	otherwise basename <kernel path> will be used"
+	echo ""
+	echo "example usage"
+	echo "-------------"
+	echo "$0 NULL-pointer-fix.patch"
+	echo "$0 NULL-pointer-fix.patch ~/kernel/linux-2.6"
+	echo "$0 NULL-pointer-fix.patch ~/kernel/linux-2.6 pci 2.6"
+
+	exit 1
+fi
+
+FILE=$1
+shift
+
+if [ ! -f $FILE ]; then
+	echo "No such file $1"
+	exit 2
+fi
+
+# try the git cherry-pick -x marker first
+commit=$(sed -n 's/^(cherry picked from commit \([0-9a-f]*\))/\1/p' "$FILE")
+if test -z "$commit"; then
+	commit=$(head -n1 $FILE | sed -n "s%From\s\([0-9a-f]*\)\s.*%\1%p")
+else
+	sed -i '/^(cherry picked from commit/d' "$FILE"
+fi
+if [ "z$commit" = "z" ]; then
+	echo "$FILE doesn't look like a patch from git"
+else
+	patch-tag -A git-commit="$commit" $FILE
+fi
+
+if [ $# -eq 0 ]; then
+	libdir=$(dirname "$(readlink -f "$0")")
+	DIR=$("$libdir"/linux_git.sh) || exit 1
+else
+	DIR=$1
+	shift
+fi
+
+commit=$(patch-tag -p git-commit $FILE | grep -i "git-commit:" | sed "s%.*:\s\(.*\)%\1%g")
+
+if [ "z$commit" = "z" ]; then
+	echo "No git-commit tag in $FILE"
+	exit 3
+fi
+
+export GIT_DIR=$DIR/.git
+
+if [ ! -d $GIT_DIR ]; then
+	echo "No such directory $GIT_DIR"
+	echo 4
+fi
+
+mainline=$(git describe --contains --match 'v*' $commit 2> /dev/null)
+if test -z "$mainline"; then
+	mainline=$(git describe --contains  $commit 2> /dev/null)
+fi
+mainline=${mainline%%[~^]*}
+
+if [ "z$mainline" = "z" ]; then
+	if git show $commit > /dev/null 2> /dev/null; then
+		patch-tag -A Patch-mainline="Queued in subsystem maintainer repository" "$FILE"
+		if test -n "$1"; then
+			patch-tag -A Git-repo="$*" "$FILE"
+		else
+			echo "warning: Non-mainline commit in $FILE but no repo url specified"
+		fi
+		exit 0
+	else
+		echo "$commit from $FILE does not exist in $DIR"
+		exit 5
+	fi
+fi
+
+patch-tag -A Patch-mainline="$mainline" $FILE
